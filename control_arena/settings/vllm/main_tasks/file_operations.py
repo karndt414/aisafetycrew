@@ -1,0 +1,426 @@
+"""File operations for the main tasks generation script."""
+
+import csv
+import os
+from pathlib import Path
+from typing import Any, TextIO, cast
+
+import anyio
+import pandas as pd
+from datasets import Dataset
+from git import Repo
+from huggingface_hub import HfApi, create_repo
+from tqdm import tqdm
+
+from control_arena._async_utils import as_completed_with_exceptions
+from control_arena.settings.vllm.task.dataset import load_main_task_dataset
+
+from .models import CommitData, TaskResult
+from .task_generation import generate_task_from_commit
+
+
+def load_existing_data(csv_file: str) -> tuple[set[str], set[str]]:
+    """Load existing commit hashes and task titles from CSV file."""
+    if not os.path.exists(csv_file):
+        return set(), set()
+
+    existing_hashes = set()
+    existing_titles = set()
+    try:
+        with open(csv_file, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if "commit_hash" in row and row["commit_hash"]:
+                    existing_hashes.add(row["commit_hash"])
+                if "task_title" in row and row["task_title"]:
+                    # Don't track skip/error titles for uniqueness
+                    title = row["task_title"]
+                    if not title.startswith(("SKIPPED_", "ERROR:")):
+                        existing_titles.add(title)
+        print(
+            f"Found {len(existing_hashes)} existing commits and {len(existing_titles)} existing task titles in {csv_file}"
+        )
+    except Exception as e:
+        print(f"Warning: Could not read existing CSV file {csv_file}: {e}")
+        return set(), set()
+
+    return existing_hashes, existing_titles
+
+
+def load_title_overrides(dataset_version: str) -> dict[str, str]:
+    """Map commit hash to task title as published in an earlier dataset version.
+
+    Regeneration would otherwise give every commit a freshly invented title, which silently breaks `VALIDATED_TASK_COMBINATIONS` and any `main_task` regex a user has pinned. Reusing the published title for commits that already have one keeps both working; only the instructions change.
+
+    Args:
+        dataset_version: A key of `DATASET_VERSIONS` to take titles from.
+
+    Returns:
+        Commit hash to task title, skipping rows whose title is an error or skip marker.
+    """
+    rows = cast(list[dict[str, Any]], list(load_main_task_dataset(dataset_version)))
+    overrides = {
+        row["commit_hash"]: row["task_title"]
+        for row in rows
+        if row["commit_hash"]
+        and not str(row["task_title"]).startswith(("SKIPPED_", "ERROR:"))
+    }
+    print(
+        f"Loaded {len(overrides)} task titles to preserve from dataset {dataset_version}"
+    )
+    return overrides
+
+
+def prepare_output_file(output_file: str, resume: bool = False) -> None:
+    """Prepare output file, warning if it already exists."""
+    output_path = Path(output_file)
+
+    # Create directory if needed
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Handle existing file based on resume mode
+    if output_path.exists():
+        if resume:
+            print(f"Resume mode: Will append to existing file {output_file}")
+        else:
+            print(
+                f"WARNING: Output file {output_file} already exists and will be overwritten."
+            )
+    else:
+        if resume:
+            print(
+                f"Resume mode enabled but no existing file found at {output_file}. Starting fresh."
+            )
+
+
+def setup_csv_writer(
+    output_file: str, resume: bool = False, enable_overlap_scoring: bool = False
+) -> tuple[TextIO, csv.DictWriter]:
+    """Set up CSV file and writer for streaming results."""
+    mode = "a" if resume and os.path.exists(output_file) else "w"
+    csvfile = open(output_file, mode, newline="", encoding="utf-8")
+
+    fieldnames = [
+        "commit_hash",
+        "parent_hash",
+        "commit_title",
+        "commit_url",
+        "task_title",
+        "task_instructions",
+        "commit_line_count",
+        "commit_categories",
+        # The sandbox is offline, so tasks needing the network are filtered out by
+        # default at load time. See main_tasks/internet_requirement.py.
+        "requires_internet",
+        "requires_internet_reason",
+    ]
+
+    # Add overlap scoring columns if enabled
+    if enable_overlap_scoring:
+        from control_arena.settings.vllm.side_tasks import side_tasks
+
+        for task_name in side_tasks.keys():
+            fieldnames.append(f"overlap_{task_name}")
+
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+    # Only write header if we're starting fresh
+    if mode == "w":
+        writer.writeheader()
+
+    return csvfile, writer
+
+
+async def process_commits_streaming(
+    commit_data: list[CommitData],
+    config: dict,
+    existing_hashes: set[str] | None = None,
+    used_titles: set[str] | None = None,
+) -> None:
+    """Process commits with streaming CSV output and progress tracking."""
+    if existing_hashes is None:
+        existing_hashes = set()
+    if used_titles is None:
+        used_titles = set()
+
+    # Setup CSV for streaming writes
+    enable_overlap_scoring = config.get("enable_overlap_scoring", False)
+    csvfile, writer = setup_csv_writer(
+        config["output_file"], config["resume"], enable_overlap_scoring
+    )
+
+    # Titles carried over from an earlier dataset version are reserved before any new
+    # title is minted, so a freshly generated title can never collide with one.
+    title_overrides = config.get("title_overrides") or {}
+    used_titles.update(title_overrides.values())
+
+    max_concurrency = config.get("max_concurrency", 20)
+
+    # Bound how many commits are in flight, not just how many model calls are. Every
+    # coroutine below is started at once, and a commit makes two model calls in
+    # sequence; throttling only at the model means the second call queues behind the
+    # first call of every other commit. Over a dataset this size that is head-of-line
+    # blocking severe enough that nothing finishes until almost everything has, which
+    # empties the streaming writes of their point -- no rows land, so an interrupted run
+    # resumes from nothing. A slot held across both calls keeps each commit's pair
+    # adjacent, and with one call in flight per commit this still saturates the model's
+    # connection pool.
+    commit_slots = anyio.Semaphore(max_concurrency)
+
+    async def generate_one(data: CommitData) -> TaskResult | None:
+        async with commit_slots:
+            return await generate_task_from_commit(
+                model_name=config["model_name"],
+                commit_data=data,
+                existing_hashes=existing_hashes,
+                used_titles=used_titles,
+                enable_overlap_scoring=config.get("enable_overlap_scoring", False),
+                max_concurrency=max_concurrency,
+                repo_path=config.get("repo_path"),
+                title_override=title_overrides.get(data.commit_hash),
+            )
+
+    try:
+        tasks = [generate_one(data) for data in commit_data]
+
+        # Process with progress bar and streaming writes
+        processed_count = 0
+        skipped_count = 0
+        with tqdm(total=len(tasks), desc="Processing commits") as pbar:
+            # Results are written as they land rather than gathered at the end,
+            # so a long generation run is resumable if it is interrupted, and
+            # one bad commit does not abandon the rest.
+            async with as_completed_with_exceptions(tasks) as outcomes:
+                async for outcome in outcomes:
+                    pbar.update(1)
+
+                    if isinstance(outcome, Exception):
+                        print(f"Error processing task: {outcome}")
+                        continue
+
+                    if outcome is None:
+                        # Skip if commit was already processed
+                        skipped_count += 1
+                        continue
+
+                    row = {
+                        "commit_hash": outcome.commit_hash,
+                        "parent_hash": outcome.parent_hash,
+                        "commit_title": outcome.commit_title,
+                        "commit_url": outcome.commit_url,
+                        "task_title": outcome.task_title,
+                        "task_instructions": outcome.task_instructions,
+                        "commit_line_count": outcome.commit_line_count,
+                        "commit_categories": outcome.commit_categories,
+                        "requires_internet": outcome.requires_internet,
+                        "requires_internet_reason": outcome.requires_internet_reason,
+                    }
+
+                    # Add overlap scores if available
+                    if outcome.overlap_scores:
+                        row.update(outcome.overlap_scores)
+
+                    writer.writerow(row)
+                    csvfile.flush()  # Ensure data is written immediately
+                    processed_count += 1
+
+    finally:
+        csvfile.close()
+
+    print(
+        f"\nCompleted! {processed_count} new results saved to {config['output_file']}"
+    )
+    if skipped_count > 0:
+        print(f"Skipped {skipped_count} already processed commits")
+
+
+def save_parquet_format(csv_file: str, parquet_file: str) -> None:
+    """Convert CSV to Parquet format."""
+    print(f"Converting to Parquet format: {parquet_file}")
+    df = pd.read_csv(csv_file)
+    df.to_parquet(parquet_file, index=False)
+    print(f"Parquet file saved: {parquet_file}")
+
+
+def save_additional_formats(csv_file: str, config: dict) -> None:
+    """Save dataset in additional formats based on configuration."""
+    output_format = config["output_format"]
+    base_path = Path(csv_file).with_suffix("")
+
+    if output_format in ["parquet", "both"]:
+        parquet_file = f"{base_path}.parquet"
+        save_parquet_format(csv_file, parquet_file)
+
+    print(f"Dataset saved in {output_format} format(s)")
+
+
+def generate_dataset_readme(config: dict, num_tasks: int) -> str:
+    """Generate README content for the dataset."""
+    return f"""---
+license: mit
+language:
+- en
+tags:
+- code
+- programming
+- tasks
+- vllm
+- git-commits
+size_categories:
+- 1K<n<10K
+task_categories:
+- text-generation
+- code-generation
+---
+
+# vLLM Main Tasks Dataset
+
+{config["dataset_description"]}
+
+## Dataset Description
+
+This dataset contains {num_tasks} coding tasks automatically generated from git commits in the vLLM repository. Each task represents a real-world coding challenge derived from actual development work.
+
+## Dataset Structure
+
+The dataset contains the following columns:
+
+- `commit_hash`: The git commit hash
+- `parent_hash`: The parent commit hash
+- `commit_title`: The original commit title
+- `commit_url`: URL to view the commit on GitHub
+- `task_title`: Generated task title in snake_case format
+- `task_instructions`: Generated instructions for implementing the functionality
+- `commit_line_count`: Number of lines in the git diff
+- `commit_categories`: Comma-separated categories extracted from commit title brackets (e.g., "bugfix,performance")
+- `requires_internet`: Whether completing the task needs network access, which the sandbox does not have. Empty means unclassified
+- `requires_internet_reason`: One-sentence justification for the above
+
+## Usage
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("your-org/your-dataset-name")
+```
+
+## Generation Process
+
+Tasks were generated using {config["model_name"]} by:
+1. Analyzing git commit diffs
+2. Extracting the functional changes
+3. Creating task instructions that focus on the desired outcome rather than implementation details
+"""
+
+
+def create_huggingface_dataset(csv_file: str, config: dict) -> Dataset:
+    """Create a HuggingFace Dataset from CSV file."""
+    print("Creating HuggingFace Dataset...")
+    df = pd.read_csv(csv_file)
+
+    # Filter out error rows for cleaner dataset
+    df_clean = df[~df["task_title"].str.startswith("ERROR:", na=False)]
+    df_clean = df_clean[df_clean["task_title"] != "SKIPPED_EMPTY_DIFF"]
+
+    print(f"Original rows: {len(df)}, Clean rows: {len(df_clean)}")
+
+    return Dataset.from_pandas(df_clean)
+
+
+async def upload_to_huggingface(csv_file: str, config: dict) -> None:
+    """Upload dataset to HuggingFace Hub."""
+    if not config["upload_to_hf"]:
+        return
+
+    if not config["hf_dataset_name"]:
+        print("ERROR: HF_DATASET_NAME not set, skipping upload")
+        return
+
+    if not config["hf_token"]:
+        print("ERROR: HF_TOKEN not set, skipping upload")
+        return
+
+    print("Uploading to HuggingFace Hub...")
+
+    # Create dataset
+    dataset = create_huggingface_dataset(csv_file, config)
+
+    # Determine repo name
+    repo_name = config["hf_dataset_name"]
+    if config["hf_org"]:
+        repo_id = f"{config['hf_org']}/{repo_name}"
+    else:
+        repo_id = repo_name
+
+    try:
+        # Create repository
+        print(f"Creating repository: {repo_id}")
+        api = HfApi(token=config["hf_token"])
+        create_repo(
+            repo_id=repo_id,
+            repo_type="dataset",
+            exist_ok=True,
+            token=config["hf_token"],
+        )
+
+        # Upload dataset
+        print("Uploading dataset...")
+        dataset.push_to_hub(
+            repo_id,
+            token=config["hf_token"],
+            commit_message=f"Add vLLM tasks dataset with {len(dataset)} tasks",
+        )
+
+        # Generate and upload README
+        readme_content = generate_dataset_readme(config, len(dataset))
+        api.upload_file(
+            path_or_fileobj=readme_content.encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=config["hf_token"],
+            commit_message="Add dataset README",
+        )
+
+        print(f"✓ Successfully uploaded to: https://huggingface.co/datasets/{repo_id}")
+
+    except Exception as e:
+        print(f"Error uploading to HuggingFace: {e}")
+
+
+def prepare_commit_data(repo: Repo, commits: list[tuple[str, str]]) -> list[CommitData]:
+    """Prepare commit data with diffs from raw commit info."""
+    from git import exc
+
+    print("Preparing commit data...")
+    commit_data = []
+
+    for commit_hash, commit_title in commits:
+        # Get parent commit
+        try:
+            commit = repo.commit(commit_hash)
+            parent_hash = commit.parents[0].hexsha if commit.parents else None
+        except (exc.GitError, IndexError):
+            continue
+
+        if not parent_hash:
+            print(f"  Skipping commit {commit_hash} (no parent)")
+            continue
+
+        # Get diff
+        try:
+            commit_diff = repo.git.diff(parent_hash, commit_hash)
+        except exc.GitError:
+            print(f"  Skipping commit {commit_hash} (diff failed)")
+            continue
+
+        commit_data.append(
+            CommitData(
+                commit_hash=commit_hash,
+                parent_hash=parent_hash,
+                commit_title=commit_title,
+                commit_diff=commit_diff,
+            )
+        )
+
+    return commit_data
